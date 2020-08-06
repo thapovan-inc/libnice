@@ -186,6 +186,7 @@ if gio_dep.type_name() == 'internal'
 endif
 gthread_dep = dependency('gthread-2.0',
   fallback: ['glib', 'libgthread_dep'])
+liburing_dep = dependency('liburing')
 
 # Cryto library
 opt_cryptolib = get_option('crypto-library')
@@ -265,7 +266,7 @@ libm = cc.find_library('m', required: false)
 
 nice_incs = include_directories('.', 'agent', 'random', 'socket', 'stun')
 
-nice_deps = gio_deps + [gthread_dep, crypto_dep, gupnp_igd_dep] + syslibs
+nice_deps = gio_deps + [gthread_dep, crypto_dep, gupnp_igd_dep, liburing_dep] + syslibs
 
 ignored_iface_prefix = get_option('ignored-network-interface-prefix')
 if ignored_iface_prefix != []

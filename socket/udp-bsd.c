@@ -56,6 +56,7 @@
 #include <unistd.h>
 #endif
 
+#include <liburing.h>
 
 static void socket_close (NiceSocket *sock);
 static gint socket_recv_messages (NiceSocket *sock,
@@ -69,6 +70,9 @@ static gboolean socket_can_send (NiceSocket *sock, NiceAddress *addr);
 static void socket_set_writable_callback (NiceSocket *sock,
     NiceSocketWritableCb callback, gpointer user_data);
 
+#define QUEUE_DEPTH 8
+#define SUBMIT_WAIT_DURATION_NS 10000
+
 struct UdpBsdSocketPrivate
 {
   GMutex mutex;
@@ -76,6 +80,7 @@ struct UdpBsdSocketPrivate
   /* protected by mutex */
   NiceAddress niceaddr;
   GSocketAddress *gaddr;
+  struct io_uring ring;
 };
 
 NiceSocket *
@@ -148,6 +153,15 @@ nice_udp_bsd_socket_new (NiceAddress *addr)
   nice_address_set_from_sockaddr (&sock->addr, &name.addr);
 
   priv = sock->priv = g_slice_new0 (struct UdpBsdSocketPrivate);
+  int _ret = io_uring_queue_init(QUEUE_DEPTH, &priv->ring, 0);
+  if (_ret) {
+      g_slice_free(struct UdpBsdSocketPrivate,priv);
+      g_slice_free (NiceSocket, sock);
+      g_socket_close (gsock, NULL);
+      g_object_unref (gsock);
+      return NULL;
+  }
+
   nice_address_init (&priv->niceaddr);
 
   sock->type = NICE_SOCKET_TYPE_UDP_BSD;
@@ -159,6 +173,8 @@ nice_udp_bsd_socket_new (NiceAddress *addr)
   sock->can_send = socket_can_send;
   sock->set_writable_callback = socket_set_writable_callback;
   sock->close = socket_close;
+
+
 
   g_mutex_init (&priv->mutex);
 
@@ -172,6 +188,7 @@ socket_close (NiceSocket *sock)
 
   g_clear_object (&priv->gaddr);
   g_mutex_clear (&priv->mutex);
+  io_uring_queue_exit(&priv->ring);
   g_slice_free (struct UdpBsdSocketPrivate, sock->priv);
   sock->priv = NULL;
 
@@ -288,28 +305,60 @@ socket_send_messages (NiceSocket *sock, const NiceAddress *to,
   }
   g_mutex_unlock (&priv->mutex);
 
-  if (n_messages == 1) {
-    /* Single message: use g_socket_send_message */
-    len = g_socket_send_message (sock->fileno, gaddr, messages->buffers,
-        messages->n_buffers, NULL, 0, G_SOCKET_MSG_NONE, NULL, &child_error);
-    if(len > 0)
-      len = 1;
-  } else {
-    /* Multiple messages: use g_socket_send_messages, which might use
-     * the more efficient sendmmsg if supported by the platform */
-    GOutputMessage *go_messages = g_alloca (n_messages * sizeof (GOutputMessage));
+  int _native_sock_fd = g_socket_get_fd(sock->fileno);
+
+
+    struct msghdr *msgs = g_malloc( n_messages * sizeof(struct msghdr));
+    int msg_count = 0;
+    struct io_uring_cqe cqe[n_messages];
+    struct io_uring_cqe *current_cqe = cqe;
     for (i = 0; i < n_messages; i++) {
+        if(io_uring_sq_space_left(&priv->ring)<1) {
+            io_uring_submit_and_wait(&priv->ring,msg_count);
+            int __ret = io_uring_wait_cqe_nr(&priv->ring,&current_cqe,msg_count);
+            if (__ret < 0) {
+                //TODO: Error log
+            } else {
+                io_uring_cq_advance(&priv->ring,msg_count);
+                current_cqe += msg_count;
+            }
+            msg_count=0;
+        }
       const NiceOutputMessage *message = &messages[i];
-      go_messages[i].address = gaddr;
-      go_messages[i].vectors = message->buffers;
-      go_messages[i].num_vectors = message->n_buffers;
-      go_messages[i].bytes_sent = 0;
-      go_messages[i].control_messages = NULL;
-      go_messages[i].num_control_messages = 0;
+      struct iovec iov = {
+              .iov_base = message->buffers->buffer,
+              .iov_len = message->buffers->size,
+      };
+      msgs[i].msg_iov = &iov;
+      msgs[i].msg_iovlen = 1;
+      msgs[i].msg_name = (to->s.addr.sa_family == AF_INET)? (void *)&to->s.ip4 : (void *) &to->s.ip6;
+      msgs[i].msg_namelen = (to->s.addr.sa_family == AF_INET)? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+
+      //TODO: Queue into SQ of the ring buffer
+      struct io_uring_sqe *sqe = io_uring_get_sqe(&priv->ring);
+      io_uring_prep_sendmsg(sqe,_native_sock_fd,&msgs[i],0);
+      msg_count++;
     }
-    len = g_socket_send_messages (sock->fileno, go_messages,
-        n_messages, G_SOCKET_MSG_NONE, NULL, &child_error);
-  }
+    if (msg_count) {
+        io_uring_submit_and_wait(&priv->ring,msg_count);
+        int __ret = io_uring_wait_cqe_nr(&priv->ring,&current_cqe,msg_count);
+        if (__ret < 0) {
+            //TODO: Error log
+        } else {
+            io_uring_cq_advance(&priv->ring,msg_count);
+        }
+        msg_count=0;
+    }
+    len = 0;
+    for (int __i=0; __i < n_messages; __i++) {
+        if (cqe->res >= 0) {
+            len++;
+        } else {
+            //TODO: Error log
+        }
+    }
+//    len = g_socket_send_messages (sock->fileno, go_messages,
+//        n_messages, G_SOCKET_MSG_NONE, NULL, &child_error);
 
   if (len < 0) {
     if (g_error_matches (child_error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
