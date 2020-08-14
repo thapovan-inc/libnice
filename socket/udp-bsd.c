@@ -281,7 +281,6 @@ socket_send_messages(NiceSocket *sock, const NiceAddress *to,
     guint i;
 
     struct UdpBsdSocketPrivate *priv = sock->priv;
-    GError *child_error = NULL;
     gint len;
     GSocketAddress *gaddr = NULL;
 
@@ -316,10 +315,9 @@ socket_send_messages(NiceSocket *sock, const NiceAddress *to,
     g_mutex_unlock(&priv->mutex);
 
     int _native_sock_fd = g_socket_get_fd(sock->fileno);
-    NiceAddress * dest_addr = to;
+    const NiceAddress * dest_addr = to;
     void *msg_name;
     socklen_t msg_namelen;
-    struct sockaddr_in saddr;
 
     {
         union {
@@ -349,7 +347,7 @@ socket_send_messages(NiceSocket *sock, const NiceAddress *to,
             msg_name = &saddr;
             msg_namelen = sizeof(struct sockaddr_in6);
         } else {
-            syslog(LOG_ERR, "Unknown socket family", dest_addr->s.addr.sa_family);
+            syslog(LOG_ERR, "Unknown socket family %d", dest_addr->s.addr.sa_family);
         }
     }
 
@@ -390,7 +388,7 @@ socket_send_messages(NiceSocket *sock, const NiceAddress *to,
         int __ret = io_uring_wait_cqe_nr(&priv->ring, &current_cqe, msg_count);
         if (__ret < 0) {
             syslog(LOG_ERR, "Error reported when waiting for completion event %s", strerror(__ret));
-s        } else {
+        } else {
             io_uring_cq_advance(&priv->ring, msg_count);
         }
         msg_count = 0;
